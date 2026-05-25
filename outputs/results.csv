@@ -1,0 +1,3 @@
+classifier,train_time,test_time,accuracy,recall,precision,f1
+XGBoost (standalone),5.545,0.0,0.92648,0.787552,0.988948,0.876834
+Hybrid Bi-LSTM+XGBoost,2158.289,82.0804,0.982281,0.964021,0.982326,0.973088

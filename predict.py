@@ -1,101 +1,90 @@
-"""
-predict.py
-----------
-Demo dự đoán 1 URL bất kỳ sau khi đã train xong.
+"""Run inference with a trained phishing URL detector."""
 
-Cách dùng:
-    python predict.py --url "http://paypal-secure-login.xyz/account/verify"
-    python predict.py --url "https://google.com"
-    python predict.py  # Chạy với một số URL mẫu
-"""
+from __future__ import annotations
 
+import argparse
 import os
 import sys
-import argparse
-import warnings
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from pathlib import Path
 
-import numpy as np
-import joblib
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 from tensorflow.keras.models import load_model
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-def load_trained_model(output_dir: str = "outputs"):
-    """Load model đã train."""
-    model_dir = f"{output_dir}/models"
+from src.feature_extractor import extract_batch
+from src.xgboost_branch import XGBoostBranch
 
-    if not os.path.exists(f"{model_dir}/hybrid_keras.h5"):
-        print("❌ Chưa train model! Chạy: python train.py")
-        sys.exit(1)
-
-    keras_model = load_model(f"{model_dir}/hybrid_keras.h5")
-    xgb_model   = joblib.load(f"{model_dir}/xgb_branch.pkl")
-    processor   = joblib.load(f"{model_dir}/url_processor.pkl")
-
-    return keras_model, xgb_model, processor
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 
-def predict_url(url: str, keras_model, xgb_model, processor) -> dict:
-    """
-    Dự đoán 1 URL.
+def load_trained_model(output_dir: Path):
+    model_dir = output_dir / "models"
+    keras_path = model_dir / "hybrid_keras.h5"
+    xgb_path = model_dir / "xgb_branch.pkl"
+    processor_path = model_dir / "url_processor.pkl"
 
-    Returns:
-        dict với 'label', 'confidence', 'verdict'
-    """
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from src.feature_extractor import extract_features
+    missing = [path for path in [keras_path, xgb_path, processor_path] if not path.exists()]
+    if missing:
+        missing_text = "\n".join(str(path) for path in missing)
+        raise FileNotFoundError(f"Missing trained model files:\n{missing_text}\nRun train.py first.")
 
-    # Xử lý URL
+    import joblib
+
+    keras_model = load_model(keras_path)
+    xgb_branch = XGBoostBranch().load(xgb_path)
+    processor = joblib.load(processor_path)
+    return keras_model, xgb_branch, processor
+
+
+def predict_url(url: str, keras_model, xgb_branch: XGBoostBranch, processor) -> dict:
     X_seq = processor.transform([url])
-    X_feat = np.array([extract_features(url)], dtype=np.float32)
-    xgb_prob = xgb_model.predict_proba(X_feat)[:, 1].reshape(-1, 1)
-
-    # Dự đoán
-    prob = float(keras_model.predict([X_seq, xgb_prob], verbose=0).flatten()[0])
-    label = 1 if prob >= 0.5 else 0
-
+    X_feat = extract_batch([url])
+    xgb_prob = xgb_branch.get_proba(X_feat)
+    probability = float(keras_model.predict([X_seq, xgb_prob], verbose=0).flatten()[0])
+    label = int(probability >= 0.5)
     return {
-        'url'       : url,
-        'label'     : label,
-        'confidence': prob if label == 1 else 1 - prob,
-        'verdict'   : '⚠️  PHISHING' if label == 1 else '✅ LEGITIMATE'
+        "url": url,
+        "label": label,
+        "probability": probability,
+        "confidence": probability if label else 1.0 - probability,
+        "verdict": "PHISHING" if label else "LEGITIMATE",
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Phishing URL Detector')
-    parser.add_argument('--url', type=str, default=None, help='URL cần kiểm tra')
-    parser.add_argument('--output-dir', type=str, default='outputs')
-    args = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Phishing URL detector inference")
+    parser.add_argument("--url", type=str, default=None, help="Single URL to check")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    return parser.parse_args()
 
-    print("Loading model...")
-    keras_model, xgb_model, processor = load_trained_model(args.output_dir)
 
-    if args.url:
-        urls_to_test = [args.url]
-    else:
-        # URL mẫu để demo
-        urls_to_test = [
-            "https://www.google.com",
-            "https://github.com/login",
-            "http://paypal-secure-login.xyz/account/verify",
-            "http://192.168.1.1/bank/login.php?user=admin",
-            "https://bit.ly/3abc123",
-            "http://www.amazon.com.security-update.tk/signin",
-        ]
-        print("\n📋 Chạy demo với các URL mẫu:\n")
+def main() -> None:
+    args = parse_args()
+    keras_model, xgb_branch, processor = load_trained_model(args.output_dir)
 
-    print("\n" + "=" * 70)
-    print(f"{'URL':<45} | {'Verdict':<15} | {'Confidence':>10}")
-    print("-" * 70)
+    urls = [args.url] if args.url else [
+        "https://www.google.com",
+        "https://github.com/login",
+        "http://paypal-secure-login.xyz/account/verify",
+        "http://192.168.1.1/bank/login.php?user=admin",
+        "https://bit.ly/3abc123",
+        "http://www.amazon.com.security-update.tk/signin",
+    ]
 
-    for url in urls_to_test:
-        result = predict_url(url, keras_model, xgb_model, processor)
-        url_display = url[:43] + '..' if len(url) > 45 else url
-        print(f"{url_display:<45} | {result['verdict']:<15} | {result['confidence']:>9.1%}")
-
-    print("=" * 70)
+    print("\n" + "=" * 86)
+    print(f"{'URL':<56} | {'Verdict':<10} | {'Phishing Prob':>13} | {'Confidence':>10}")
+    print("-" * 86)
+    for url in urls:
+        result = predict_url(url, keras_model, xgb_branch, processor)
+        url_display = url[:53] + "..." if len(url) > 56 else url
+        print(
+            f"{url_display:<56} | {result['verdict']:<10} | "
+            f"{result['probability']:>12.1%} | {result['confidence']:>9.1%}"
+        )
+    print("=" * 86)
 
 
 if __name__ == "__main__":

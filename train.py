@@ -1,226 +1,200 @@
-"""
-train.py
---------
-Script huấn luyện chính cho Hybrid Bi-LSTM + XGBoost Phishing Detector.
+"""Train the Hybrid Bi-LSTM + XGBoost phishing URL detector."""
 
-Cách chạy:
-    python train.py
+from __future__ import annotations
 
-Yêu cầu:
-    - Dataset đặt tại: data/raw/URL_Classification.csv  (ISCX format)
-    - Hoặc chỉnh DATA_PATH và DATA_FORMAT bên dưới
-
-Tham khảo pipeline từ:
-    [1] Shahrivari et al. (2020). arXiv:2009.11116
-    [2] Le et al. (2018). arXiv:1802.03162
-"""
-
+import argparse
 import os
 import sys
 import time
-import warnings
-warnings.filterwarnings('ignore')
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Tắt log verbose của TensorFlow
+from pathlib import Path
 
-import numpy as np
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+import joblib
 import pandas as pd
+import random
+import numpy as np
+import tensorflow as tf
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 
-# ─── Import các module trong project ──────────────────────────────────────────
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.url_processor import URLProcessor
-from src.feature_extractor import extract_batch, FEATURE_NAMES
 from src.bilstm_branch import build_bilstm_branch
-from src.xgboost_branch import XGBoostBranch
+from src.feature_extractor import FEATURE_NAMES, extract_batch
 from src.hybrid_model import build_hybrid_model, get_callbacks
-from src.utils import (load_iscx_dataset, load_custom_dataset,
-                       evaluate_model, print_results_table,
-                       plot_confusion_matrix, plot_training_history,
-                       plot_feature_importance)
+from src.url_processor import URLProcessor
+from src.utils import (
+    evaluate_model,
+    load_custom_dataset,
+    load_iscx_dataset,
+    plot_confusion_matrix,
+    plot_feature_importance,
+    plot_training_history,
+    print_results_table,
+)
+from src.xgboost_branch import XGBoostBranch
+
+DEFAULT_DATA_PATH = PROJECT_ROOT / "data_src_notebooks" / "raw" / "malicious_phish.csv"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CẤU HÌNH — Chỉnh sửa ở đây
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Đường dẫn dataset
-DATA_PATH = "data/raw/URL_Classification.csv"
-
-# Format dataset: 'iscx' hoặc 'custom'
-DATA_FORMAT = 'iscx'
-
-# Hyperparameters
-MAX_URL_LEN  = 200    # Độ dài URL tối đa (ký tự)
-EMBED_DIM    = 32     # Embedding dimension
-LSTM_UNITS   = 64     # Số đơn vị LSTM mỗi chiều
-DROPOUT      = 0.3    # Dropout rate
-EPOCHS       = 20     # Số epoch tối đa (EarlyStopping sẽ dừng sớm hơn)
-BATCH_SIZE   = 64     # Batch size
-TEST_SIZE    = 0.2    # Tỷ lệ test set
-VAL_SIZE     = 0.1    # Tỷ lệ validation set (từ train set)
-RANDOM_STATE = 42
-
-# Thư mục output
-OUTPUT_DIR   = "outputs"
-
-# ═══════════════════════════════════════════════════════════════════════════════
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train phishing URL detector")
+    parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH)
+    parser.add_argument("--data-format", choices=["iscx", "custom"], default="iscx")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--max-url-len", type=int, default=200)
+    parser.add_argument("--embed-dim", type=int, default=32)
+    parser.add_argument("--lstm-units", type=int, default=64)
+    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--test-size", type=float, default=0.2)
+    parser.add_argument("--val-size", type=float, default=0.1)
+    parser.add_argument("--random-state", type=int, default=42)
+    return parser.parse_args()
 
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs("data/processed", exist_ok=True)
+def load_dataset(path: Path, data_format: str) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Dataset not found: {path}\n"
+            "Pass --data-path or generate a demo dataset with create_demo_dataset.py."
+        )
+    return load_iscx_dataset(path) if data_format == "iscx" else load_custom_dataset(path)
 
-    print("=" * 65)
-    print("  HYBRID BI-LSTM + XGBOOST — PHISHING URL DETECTOR")
-    print("  Ref: Shahrivari et al. (2020) + Le et al. (2018)")
-    print("=" * 65)
 
-    # ── 1. Load Dataset ────────────────────────────────────────────────────
-    print("\n[1/6] Loading dataset...")
-    if not os.path.exists(DATA_PATH):
-        print(f"\n⚠️  Không tìm thấy dataset tại: {DATA_PATH}")
-        print("Vui lòng:")
-        print("  1. Tải ISCX-URL-2016 tại: https://www.unb.ca/cic/datasets/url-2016.html")
-        print("  2. Đặt file vào: data/raw/URL_Classification.csv")
-        print("\nHoặc dùng script tạo dataset demo:")
-        print("  python create_demo_dataset.py")
-        sys.exit(1)
-
-    if DATA_FORMAT == 'iscx':
-        df = load_iscx_dataset(DATA_PATH)
-    else:
-        df = load_custom_dataset(DATA_PATH)
-
-    urls = df['url'].tolist()
-    labels = df['label'].values
-
-    # ── 2. Chia Train/Val/Test ─────────────────────────────────────────────
-    print("\n[2/6] Chia dữ liệu Train/Val/Test...")
+def split_dataset(urls, labels, args: argparse.Namespace):
     X_trainval, X_test, y_trainval, y_test = train_test_split(
-        urls, labels,
-        test_size=TEST_SIZE,
+        urls,
+        labels,
+        test_size=args.test_size,
         stratify=labels,
-        random_state=RANDOM_STATE
+        random_state=args.random_state,
     )
+    relative_val_size = args.val_size / (1 - args.test_size)
     X_train, X_val, y_train, y_val = train_test_split(
-        X_trainval, y_trainval,
-        test_size=VAL_SIZE / (1 - TEST_SIZE),
+        X_trainval,
+        y_trainval,
+        test_size=relative_val_size,
         stratify=y_trainval,
-        random_state=RANDOM_STATE
+        random_state=args.random_state,
     )
-    print(f"  Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
-    # ── 3. Xử lý URL (char-level tokenize) ────────────────────────────────
-    print("\n[3/6] Tokenize URL theo ký tự...")
-    processor = URLProcessor(max_len=MAX_URL_LEN)
+
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = args.output_dir / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 72)
+    print("HYBRID BI-LSTM + XGBOOST PHISHING URL DETECTOR")
+    print("=" * 72)
+
+    print("\n[1/6] Loading dataset...")
+    df = load_dataset(args.data_path, args.data_format)
+    urls = df["url"].tolist()
+    labels = df["label"].to_numpy()
+
+    print("\n[2/6] Splitting train/validation/test sets...")
+    X_train, X_val, X_test, y_train, y_val, y_test = split_dataset(urls, labels, args)
+    print(f"Train: {len(X_train):,} | Val: {len(X_val):,} | Test: {len(X_test):,}")
+
+    print("\n[3/6] Tokenizing URL strings...")
+    processor = URLProcessor(max_len=args.max_url_len)
     X_seq_train = processor.fit_transform(X_train)
-    X_seq_val   = processor.transform(X_val)
-    X_seq_test  = processor.transform(X_test)
-    vocab_size  = processor.get_vocab_size()
+    X_seq_val = processor.transform(X_val)
+    X_seq_test = processor.transform(X_test)
 
-    # ── 4. Trích xuất đặc trưng tĩnh ──────────────────────────────────────
-    print("\n[4/6] Trích xuất 15 đặc trưng tĩnh...")
+    print("\n[4/6] Extracting handcrafted URL features...")
     X_feat_train = extract_batch(X_train)
-    X_feat_val   = extract_batch(X_val)
-    X_feat_test  = extract_batch(X_test)
-    print(f"  Feature matrix shape: {X_feat_train.shape}")
+    X_feat_val = extract_batch(X_val)
+    X_feat_test = extract_batch(X_test)
+    print(f"Feature matrix: {X_feat_train.shape}")
 
-    # ── 5. Train XGBoost Branch ────────────────────────────────────────────
-    print("\n[5/6] Huấn luyện XGBoost branch...")
+    print("\n[5/6] Training XGBoost branch...")
     xgb = XGBoostBranch()
-    t0 = time.time()
+    start = time.time()
     xgb.train(X_feat_train, y_train, X_feat_val, y_val)
-    xgb_train_time = time.time() - t0
+    xgb_train_time = time.time() - start
 
-    # Lấy xác suất từ XGBoost để feed vào hybrid
     xgb_prob_train = xgb.get_proba(X_feat_train)
-    xgb_prob_val   = xgb.get_proba(X_feat_val)
-    xgb_prob_test  = xgb.get_proba(X_feat_test)
-
-    # Đánh giá XGBoost độc lập (để báo cáo)
+    xgb_prob_val = xgb.get_proba(X_feat_val)
+    xgb_prob_test = xgb.get_proba(X_feat_test)
     xgb_results = xgb.evaluate(X_feat_test, y_test)
-    print(f"  XGBoost alone → Acc: {xgb_results['accuracy']:.4f} | F1: {xgb_results['f1']:.4f}")
+    print(f"XGBoost alone: accuracy={xgb_results['accuracy']:.4f}, f1={xgb_results['f1']:.4f}")
 
-    # ── 6. Build và Train Hybrid Model ────────────────────────────────────
-    print("\n[6/6] Xây dựng và huấn luyện Hybrid Keras model...")
-    bilstm_in, bilstm_out = build_bilstm_branch(
-        input_len=MAX_URL_LEN,
-        vocab_size=vocab_size,
-        embed_dim=EMBED_DIM,
-        lstm_units=LSTM_UNITS,
-        dropout_rate=DROPOUT
+    print("\n[6/6] Training hybrid Keras model...")
+    bilstm_input, bilstm_output = build_bilstm_branch(
+        input_len=args.max_url_len,
+        vocab_size=processor.get_vocab_size(),
+        embed_dim=args.embed_dim,
+        lstm_units=args.lstm_units,
+        dropout_rate=args.dropout,
     )
     hybrid_model = build_hybrid_model(
-        bilstm_in, bilstm_out,
+        bilstm_input,
+        bilstm_output,
         xgb_feature_dim=1,
-        dropout_rate=DROPOUT
+        dropout_rate=args.dropout,
     )
-    hybrid_model.summary()
 
-    t0 = time.time()
+    start = time.time()
     history = hybrid_model.fit(
-        [X_seq_train, xgb_prob_train], y_train,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
+        [X_seq_train, xgb_prob_train],
+        y_train,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
         validation_data=([X_seq_val, xgb_prob_val], y_val),
         callbacks=get_callbacks(patience=5),
-        verbose=1
+        verbose=1,
     )
-    hybrid_train_time = time.time() - t0
+    hybrid_train_time = time.time() - start
 
-    # ── Evaluate ───────────────────────────────────────────────────────────
-    print("\n" + "=" * 65)
-    print("ĐÁNH GIÁ KẾT QUẢ")
-    print("=" * 65)
-
-    t0 = time.time()
+    start = time.time()
     y_prob = hybrid_model.predict([X_seq_test, xgb_prob_test], verbose=0).flatten()
-    hybrid_test_time = time.time() - t0
+    hybrid_test_time = time.time() - start
     y_pred = (y_prob >= 0.5).astype(int)
+    auc = roc_auc_score(y_test, y_prob)
 
-    all_results = [
+    print(f"ROC-AUC: {auc:.4f}")
+
+    results = [
         evaluate_model(
             "XGBoost (standalone)",
             y_test,
             (xgb_prob_test.flatten() >= 0.5).astype(int),
-            train_time=xgb_train_time
+            train_time=xgb_train_time,
         ),
         evaluate_model(
             "Hybrid Bi-LSTM+XGBoost",
-            y_test, y_pred,
+            y_test,
+            y_pred,
             train_time=hybrid_train_time,
-            test_time=hybrid_test_time
+            test_time=hybrid_test_time,
         ),
     ]
+    print_results_table(results)
 
-    print_results_table(all_results)
+    hybrid_model.save(model_dir / "hybrid_keras.keras ")
+    xgb.save(model_dir / "xgb_branch.pkl")
+    joblib.dump(processor, model_dir / "url_processor.pkl")
 
-    # ── Lưu kết quả ───────────────────────────────────────────────────────
-    print("\nLưu model và biểu đồ...")
-    os.makedirs(f"{OUTPUT_DIR}/models", exist_ok=True)
-    hybrid_model.save(f"{OUTPUT_DIR}/models/hybrid_keras.h5")
-    xgb.save(f"{OUTPUT_DIR}/models/xgb_branch.pkl")
+    plot_confusion_matrix(y_test, y_pred, "Hybrid Model Confusion Matrix", args.output_dir / "confusion_matrix.png")
+    plot_training_history(history, args.output_dir / "training_history.png")
+    plot_feature_importance(xgb.feature_importance(FEATURE_NAMES), args.output_dir / "feature_importance.png")
+    pd.DataFrame(results).to_csv(args.output_dir / "results.csv", index=False)
 
-    import joblib
-    joblib.dump(processor, f"{OUTPUT_DIR}/models/url_processor.pkl")
-
-    plot_confusion_matrix(y_test, y_pred, "Hybrid Model — Confusion Matrix",
-                          save_path=f"{OUTPUT_DIR}/confusion_matrix.png")
-    plot_training_history(history,
-                          save_path=f"{OUTPUT_DIR}/training_history.png")
-    plot_feature_importance(xgb.feature_importance(FEATURE_NAMES),
-                            save_path=f"{OUTPUT_DIR}/feature_importance.png")
-
-    # Lưu bảng kết quả ra CSV
-    results_df = pd.DataFrame(all_results)
-    results_df.to_csv(f"{OUTPUT_DIR}/results.csv", index=False)
-
-    print(f"\n✅ Hoàn tất! Kết quả lưu tại: {OUTPUT_DIR}/")
-    print(f"   - confusion_matrix.png")
-    print(f"   - training_history.png")
-    print(f"   - feature_importance.png")
-    print(f"   - results.csv")
+    print(f"\nDone. Outputs saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
